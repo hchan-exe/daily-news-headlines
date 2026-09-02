@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.log
+.venv/
+venv/
+
+# Daily output archives — generated at runtime
+Daily News Headlines_*.csv
+Global Major News*.csv
+Global Major News*.xlsx
+*.csv
+*.xlsx
+output.html
+
+# Duplicate / scratch copy
+Newsheadline(copy).py
