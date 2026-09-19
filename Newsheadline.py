@@ -702,17 +702,29 @@ def scrape_wallstreetcn(limit=None):
 
 def scrape_hket(limit=None):
     limit = limit or SOURCE_LIMITS["香港經濟日報"]
-    soup = fetch_soup("https://www.hket.com/")
+    # Homepage often returns 405 from cloud IPs; use Bing News RSS as a stable source.
+    soup = fetch_soup(
+        "https://www.bing.com/news/search?q=site:hket.com&format=rss",
+        parser="xml",
+    )
     count = 0
-    for link in soup.select("a.listing-overlay"):
-        title = link.get_text(strip=True)
-        url = link.get("href", "").strip()
-        article = enrich_article_metadata({"url": url, "summary": "", "image_url": ""})
+    for item in soup.find_all("item"):
+        title = item.title.text.strip() if item.title else ""
+        bing_link = item.link.text.strip() if item.link else ""
+        article_url = extract_bing_news_url(bing_link)
+        if not title or not article_url or "hket.com" not in article_url:
+            continue
+        summary = strip_html(item.description.text if item.description else "")
+        if is_weak_summary(summary, title):
+            summary = ""
+        article = enrich_article_metadata(
+            {"url": article_url, "summary": summary, "image_url": ""}
+        )
         if add_result(
             "香港經濟日報",
             title,
-            url,
-            summary=article.get("summary", ""),
+            article_url,
+            summary=article.get("summary", summary),
             image_url=article.get("image_url", ""),
         ):
             count += 1
@@ -896,16 +908,23 @@ def send_email_outlook(subject, html_body):
 
 subject = f"{EMAIL_SUBJECT_PREFIX} - {today}"
 html_body = build_digest_email(articles, today)
+running_on_actions = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
 
 try:
     if EMAIL_USER and EMAIL_PASS:
         send_email_smtp(subject, html_body)
         print(f"Email sent via SMTP to {EMAIL_TO}.")
+    elif running_on_actions:
+        raise RuntimeError(
+            "EMAIL_USER / EMAIL_PASS secrets are missing. "
+            "Add them under Settings → Secrets and variables → Actions "
+            "(use a Gmail App Password for EMAIL_PASS)."
+        )
     else:
         send_email_outlook(subject, html_body)
         print(f"Email sent via Outlook to {EMAIL_TO}.")
 except Exception as exc:
-    channel = "SMTP" if EMAIL_USER and EMAIL_PASS else "Outlook"
+    channel = "SMTP" if EMAIL_USER and EMAIL_PASS else "email config"
     print(f"Email not sent ({channel} error): {exc}")
     print("The CSV was saved successfully. Fix email settings and run again, or send the CSV manually.")
     raise SystemExit(1) from exc

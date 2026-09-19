@@ -24,6 +24,23 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Check email secrets
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          missing=0
+          if [ -z "$EMAIL_USER" ]; then echo "Missing secret: EMAIL_USER"; missing=1; fi
+          if [ -z "$EMAIL_PASS" ]; then echo "Missing secret: EMAIL_PASS"; missing=1; fi
+          if [ -z "$EMAIL_TO" ]; then echo "Missing secret: EMAIL_TO"; missing=1; fi
+          if [ "$missing" -eq 1 ]; then
+            echo "Add secrets at: Settings → Secrets and variables → Actions"
+            echo "EMAIL_PASS must be a Gmail App Password (not your normal password)."
+            exit 1
+          fi
+          echo "Email secrets are present."
+
       - name: Run scraper and send email
         env:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
