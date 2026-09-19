@@ -4,17 +4,26 @@ import json
 import mimetypes
 import os
 import re
+import smtplib
+import ssl
 from datetime import date
 from difflib import SequenceMatcher
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from urllib.parse import parse_qs, unquote, urlparse
 
 import pandas as pd
-import pythoncom
 import requests
-import win32com.client as win32
 from bs4 import BeautifulSoup
 
-pythoncom.CoInitialize()
+try:
+    import pythoncom
+    import win32com.client as win32
+
+    pythoncom.CoInitialize()
+    OUTLOOK_AVAILABLE = True
+except ImportError:
+    OUTLOOK_AVAILABLE = False
 
 # --- Configuration ---
 MAX_TOTAL = 30
@@ -22,6 +31,15 @@ DEDUP_SIMILAR_TITLES = True
 DEDUP_THRESHOLD = 0.75
 EMAIL_SUBJECT_PREFIX = "Daily News Headlines"
 TRY_PLAYWRIGHT_FOR_BLOOMBERG = True
+
+# Email: set EMAIL_USER + EMAIL_PASS (Gmail App Password) to send via SMTP.
+# Falls back to local Outlook on Windows when SMTP secrets are not set.
+EMAIL_TO = os.environ.get("EMAIL_TO", "hchan@penjing-am.com")
+EMAIL_USER = os.environ.get("EMAIL_USER", "").strip()
+EMAIL_PASS = os.environ.get("EMAIL_PASS", "").strip()
+EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER).strip()
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 
 SOURCE_LIMITS = {
     "Bloomberg": 4,
@@ -843,14 +861,51 @@ csv_path = os.path.join(filePath, export_name + ".csv")
 df.to_csv(csv_path, encoding="utf_8_sig")
 print(f"Saved CSV: {csv_path} ({len(df)} headlines)")
 
-try:
+
+def send_email_smtp(subject, html_body):
+    if not EMAIL_USER or not EMAIL_PASS:
+        raise RuntimeError("EMAIL_USER / EMAIL_PASS not set")
+    if not EMAIL_TO:
+        raise RuntimeError("EMAIL_TO not set")
+
+    message = MIMEMultipart("alternative")
+    message["Subject"] = subject
+    message["From"] = EMAIL_FROM or EMAIL_USER
+    message["To"] = EMAIL_TO
+    message.attach(MIMEText(html_body, "html", "utf-8"))
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as server:
+        server.ehlo()
+        server.starttls(context=context)
+        server.ehlo()
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.sendmail(message["From"], [addr.strip() for addr in EMAIL_TO.split(",")], message.as_string())
+
+
+def send_email_outlook(subject, html_body):
+    if not OUTLOOK_AVAILABLE:
+        raise RuntimeError("Outlook / pywin32 is not available on this system")
     outlook = win32.Dispatch("outlook.application")
     mail = outlook.CreateItem(0)
-    mail.To = "hchan@penjing-am.com"
-    mail.Subject = f"{EMAIL_SUBJECT_PREFIX} - {today}"
-    mail.HTMLBody = build_digest_email(articles, today)
+    mail.To = EMAIL_TO
+    mail.Subject = subject
+    mail.HTMLBody = html_body
     mail.Send()
-    print("Email sent.")
+
+
+subject = f"{EMAIL_SUBJECT_PREFIX} - {today}"
+html_body = build_digest_email(articles, today)
+
+try:
+    if EMAIL_USER and EMAIL_PASS:
+        send_email_smtp(subject, html_body)
+        print(f"Email sent via SMTP to {EMAIL_TO}.")
+    else:
+        send_email_outlook(subject, html_body)
+        print(f"Email sent via Outlook to {EMAIL_TO}.")
 except Exception as exc:
-    print(f"Email not sent (Outlook error): {exc}")
-    print("The CSV was saved successfully. Open Outlook and run again, or send the CSV manually.")
+    channel = "SMTP" if EMAIL_USER and EMAIL_PASS else "Outlook"
+    print(f"Email not sent ({channel} error): {exc}")
+    print("The CSV was saved successfully. Fix email settings and run again, or send the CSV manually.")
+    raise SystemExit(1) from exc
