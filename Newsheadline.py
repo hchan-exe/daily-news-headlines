@@ -9,8 +9,10 @@ import ssl
 from datetime import date
 from difflib import SequenceMatcher
 from email.mime.application import MIMEApplication
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from io import BytesIO
 from urllib.parse import parse_qs, unquote, urlparse
 
 import pandas as pd
@@ -42,6 +44,9 @@ EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER).strip()
 EMAIL_CC = os.environ.get("EMAIL_CC", "").strip()
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+# Display size in the email. File is 2x so it stays sharp on phone screens.
+THUMB_DISPLAY_PX = 56
+THUMB_FILE_PX = 112
 
 SOURCE_LIMITS = {
     "Bloomberg": 4,
@@ -273,7 +278,21 @@ def add_result(source, title, url, summary="", image_url=""):
 def fetch_soup(url, parser="html.parser"):
     response = requests.get(url, headers=headers, timeout=30)
     response.raise_for_status()
-    return BeautifulSoup(response.content, parser)
+    parsers = ["xml", "html.parser"] if parser == "xml" else [parser]
+    last_error = None
+    for name in parsers:
+        try:
+            soup = BeautifulSoup(response.content, name)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if parser == "xml" and name == "html.parser":
+            if not (soup.find("item") or soup.find("url") or soup.find("entry")):
+                continue
+        return soup
+    if last_error:
+        raise last_error
+    return BeautifulSoup(response.content, "html.parser")
 
 
 def strip_html(text):
@@ -481,7 +500,11 @@ def collect_bloomberg_rss_items():
     items = []
     seen_urls = set()
     for feed_url in feeds:
-        soup = fetch_soup(feed_url, parser="xml")
+        try:
+            soup = fetch_soup(feed_url, parser="xml")
+        except Exception as exc:
+            print(f"Bloomberg feed skipped ({feed_url}): {exc}")
+            continue
         for item in soup.find_all("item"):
             url = item.link.text.strip() if item.link else ""
             if not url or url in seen_urls:
@@ -559,22 +582,44 @@ def enrich_article_metadata(article):
     return article
 
 
+def _xml_text(node, *tag_names):
+    if node is None:
+        return ""
+    for name in tag_names:
+        element = node.find(name)
+        if element and element.get_text(strip=True):
+            return element.get_text(strip=True)
+    return ""
+
+
 def scrape_reuters(limit=None):
+    """Reuters blocks its homepage. The public news sitemap still returns headlines."""
     limit = limit or SOURCE_LIMITS["Reuters"]
-    url = "https://www.bing.com/news/search?q=site:reuters.com+markets&format=rss"
-    soup = fetch_soup(url, parser="xml")
-    count = 0
-    for item in soup.find_all("item"):
-        title = item.title.text.strip() if item.title else ""
-        bing_link = item.link.text.strip() if item.link else ""
-        article_url = extract_bing_news_url(bing_link)
-        if not title or not article_url or "reuters.com" not in article_url:
+    soup = fetch_soup(
+        "https://www.reuters.com/arc/outboundfeeds/news-sitemap/?outputType=xml",
+        parser="xml",
+    )
+    preferred = ("/business/", "/markets/", "/world/", "/legal/", "/technology/")
+    skipped = ("/sports/", "/lifestyle/", "/podcasts/", "/es/", "/pt/", "/fr/", "/ar/", "/jp/")
+
+    ranked = []
+    for node in soup.find_all("url"):
+        url = _xml_text(node, "loc")
+        if not url.startswith("https://www.reuters.com/"):
             continue
-        summary = strip_html(item.description.text if item.description else "")
-        summary = re.sub(r"^[\W\s\d]*", "", summary).strip()
-        if is_weak_summary(summary, title):
-            summary = ""
-        if add_result("Reuters", title, article_url, summary=summary):
+        path = url.replace("https://www.reuters.com", "", 1)
+        if path.startswith(skipped):
+            continue
+        rank = 0 if path.startswith(preferred[:2]) else 1 if path.startswith(preferred) else 2
+        if rank == 2:
+            continue
+        ranked.append((rank, url, node))
+
+    count = 0
+    for _rank, url, node in sorted(ranked, key=lambda row: row[0]):
+        title = _xml_text(node, "news:title", "title")
+        image_url = _xml_text(node, "image:loc")
+        if add_result("Reuters", title, url, image_url=image_url):
             count += 1
         if count >= limit:
             break
@@ -759,72 +804,142 @@ def scrape_hkej(limit=None):
             break
 
 
-def build_digest_email(articles, date_str, embed_local_images=True):
-    items_html = []
+def load_image_bytes(image_ref):
+    if not image_ref:
+        return b""
+    if is_remote_image_url(image_ref):
+        try:
+            response = requests.get(image_ref, headers=headers, timeout=12)
+            if response.status_code == 200 and response.content:
+                return response.content
+        except Exception:
+            return b""
+        return b""
+    if os.path.isfile(image_ref):
+        with open(image_ref, "rb") as handle:
+            return handle.read()
+    return b""
 
-    for article in articles:
+
+def make_thumbnail(raw_bytes):
+    """Small square JPEG so phone mail apps actually render it."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return raw_bytes, "png"
+
+    image = Image.open(BytesIO(raw_bytes))
+    image = image.convert("RGB")
+    width, height = image.size
+    side = min(width, height)
+    left = (width - side) // 2
+    top = (height - side) // 2
+    image = image.crop((left, top, left + side, top + side))
+    image = image.resize((THUMB_FILE_PX, THUMB_FILE_PX))
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=72, optimize=True)
+    return buffer.getvalue(), "jpeg"
+
+
+def collect_inline_images(articles):
+    """Attach thumbs as cid: parts. Data-URI and remote src are blocked on mobile mail."""
+    cache = {}
+    inline = []
+    for index, article in enumerate(articles):
+        candidates = []
+        image_url = (article.get("image_url") or "").strip()
+        if image_url:
+            candidates.append(image_url)
+        logo = DEFAULT_IMAGES.get(article.get("source", ""), "")
+        if logo and logo not in candidates:
+            candidates.append(logo)
+
+        thumb = b""
+        subtype = "jpeg"
+        for candidate in candidates:
+            if candidate not in cache:
+                cache[candidate] = load_image_bytes(candidate)
+            raw = cache[candidate]
+            if not raw:
+                continue
+            thumb, subtype = make_thumbnail(raw)
+            if thumb:
+                break
+        if not thumb:
+            inline.append(None)
+            continue
+        cid = f"thumb{index}"
+        inline.append((cid, thumb, subtype))
+    return inline
+
+
+def build_digest_email(articles, date_str, inline_images):
+    items_html = []
+    thumb_px = THUMB_DISPLAY_PX
+
+    for article, image in zip(articles, inline_images):
         safe_url = html.escape(article["url"], quote=True)
         safe_title = html.escape(article["title"])
         safe_source = html.escape(article["source"])
         safe_summary = html.escape(article.get("summary") or "")
 
-        image_url = article.get("image_url", "")
-        safe_image = ""
-        if is_remote_image_url(image_url):
-            safe_image = html.escape(image_url, quote=True)
-        elif embed_local_images:
-            safe_image = local_image_to_data_uri(image_url)
-
-        image_cell = ""
-        if safe_image:
+        if image:
+            cid, _data, _subtype = image
             image_cell = (
-                f'<td width="200" valign="top" style="padding-right:16px;">'
+                f'<td width="{thumb_px + 12}" valign="top" '
+                f'style="width:{thumb_px + 12}px;padding:0 10px 0 0;">'
                 f'<a href="{safe_url}">'
-                f'<img src="{safe_image}" width="200" alt="{safe_source}" '
-                f'style="display:block;max-width:200px;height:auto;border:0;">'
+                f'<img src="cid:{cid}" width="{thumb_px}" height="{thumb_px}" '
+                f'alt="{safe_source}" '
+                f'style="display:block;width:{thumb_px}px;height:{thumb_px}px;'
+                f'border:0;border-radius:4px;">'
                 f"</a></td>"
             )
         else:
             image_cell = (
-                f'<td width="120" valign="top" style="padding-right:16px;">'
-                f'<div style="width:100px;padding:8px;background:#f2f2f2;'
-                f'color:#666666;font-size:11px;text-align:center;">'
-                f"{safe_source}</div></td>"
+                f'<td width="{thumb_px + 12}" valign="top" '
+                f'style="width:{thumb_px + 12}px;padding:0 10px 0 0;">'
+                f'<div style="width:{thumb_px}px;height:{thumb_px}px;background:#f2f2f2;'
+                f'color:#666666;font-size:10px;text-align:center;line-height:{thumb_px}px;'
+                f'border-radius:4px;">{safe_source[:3]}</div></td>'
             )
 
         items_html.append(
             f"""
-            <table width="100%" cellpadding="0" cellspacing="0"
-                   style="margin-bottom:24px;border-bottom:1px solid #eeeeee;">
+            <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
+                   style="margin-bottom:18px;border-bottom:1px solid #eeeeee;">
               <tr>
                 {image_cell}
                 <td valign="top">
-                  <p style="margin:0 0 4px;font-size:11px;color:#888888;text-transform:uppercase;letter-spacing:0.5px;">
+                  <p style="margin:0 0 2px;font-size:11px;color:#888888;">
                     {safe_source}
                   </p>
-                  <p style="margin:0 0 8px;font-size:18px;font-weight:bold;line-height:1.35;">
+                  <p style="margin:0 0 6px;font-size:16px;font-weight:bold;line-height:1.3;">
                     <a href="{safe_url}" style="color:#111111;text-decoration:none;">{safe_title}</a>
                   </p>
-                  <p style="margin:0;font-size:14px;color:#555555;line-height:1.5;">{safe_summary}</p>
+                  <p style="margin:0 0 12px;font-size:13px;color:#555555;line-height:1.4;">{safe_summary}</p>
                 </td>
               </tr>
             </table>
             """
         )
 
-    return f"""
+    html_body = f"""
     <html>
-      <body style="font-family:Arial,Helvetica,sans-serif;max-width:760px;margin:0 auto;padding:24px;color:#111111;">
-        <h1 style="text-align:center;font-size:28px;font-weight:bold;margin:0 0 8px;">
-          {html.escape(EMAIL_SUBJECT_PREFIX)} - {html.escape(date_str)}
-        </h1>
-        <p style="text-align:center;color:#888888;font-size:13px;margin:0 0 32px;">
-          {len(articles)} headlines
-        </p>
-        {''.join(items_html)}
+      <body style="font-family:Arial,Helvetica,sans-serif;margin:0;padding:0;color:#111111;">
+        <div style="max-width:680px;margin:0 auto;padding:16px;">
+          <h1 style="text-align:center;font-size:22px;font-weight:bold;margin:0 0 4px;">
+            {html.escape(EMAIL_SUBJECT_PREFIX)} - {html.escape(date_str)}
+          </h1>
+          <p style="text-align:center;color:#888888;font-size:12px;margin:0 0 20px;">
+            {len(articles)} headlines
+          </p>
+          {''.join(items_html)}
+        </div>
       </body>
     </html>
     """
+    return html_body
 
 
 scrapers = [
@@ -873,7 +988,7 @@ df.to_csv(csv_path, encoding="utf_8_sig")
 print(f"Saved CSV: {csv_path} ({len(df)} headlines)")
 
 
-def send_email_smtp(subject, html_body, attachment_path=None):
+def send_email_smtp(subject, html_body, inline_images, attachment_path=None):
     if not EMAIL_USER or not EMAIL_PASS:
         raise RuntimeError("EMAIL_USER / EMAIL_PASS not set")
     if not EMAIL_TO:
@@ -901,7 +1016,18 @@ def send_email_smtp(subject, html_body, attachment_path=None):
         plain_lines.append("")
     alt.attach(MIMEText("\n".join(plain_lines), "plain", "utf-8"))
     alt.attach(MIMEText(html_body, "html", "utf-8"))
-    message.attach(alt)
+
+    related = MIMEMultipart("related")
+    related.attach(alt)
+    for image in inline_images:
+        if not image:
+            continue
+        cid, data, subtype = image
+        part = MIMEImage(data, _subtype=subtype)
+        part.add_header("Content-ID", f"<{cid}>")
+        part.add_header("Content-Disposition", "inline", filename=f"{cid}.{subtype}")
+        related.attach(part)
+    message.attach(related)
 
     if attachment_path and os.path.isfile(attachment_path):
         with open(attachment_path, "rb") as handle:
@@ -942,13 +1068,14 @@ def send_email_outlook(subject, html_body):
 
 use_smtp = bool(EMAIL_USER and EMAIL_PASS)
 subject = f"{EMAIL_SUBJECT_PREFIX} - {today}"
-# Skip huge base64 logo embeds for SMTP — corporate filters often drop those emails.
-html_body = build_digest_email(articles, today, embed_local_images=not use_smtp)
+inline_images = collect_inline_images(articles)
+html_body = build_digest_email(articles, today, inline_images)
+print(f"Inline thumbnails: {sum(1 for image in inline_images if image)}/{len(articles)}")
 running_on_actions = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
 
 try:
     if use_smtp:
-        send_email_smtp(subject, html_body, attachment_path=csv_path)
+        send_email_smtp(subject, html_body, inline_images, attachment_path=csv_path)
         print(f"Email sent via SMTP to {EMAIL_TO}.")
         print("Also check your Gmail Sent folder (and Spam). Corporate mail may quarantine external mail.")
     elif running_on_actions:
