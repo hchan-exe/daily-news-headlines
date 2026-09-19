@@ -8,6 +8,7 @@ import smtplib
 import ssl
 from datetime import date
 from difflib import SequenceMatcher
+from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from urllib.parse import parse_qs, unquote, urlparse
@@ -36,8 +37,9 @@ TRY_PLAYWRIGHT_FOR_BLOOMBERG = True
 # Falls back to local Outlook on Windows when SMTP secrets are not set.
 EMAIL_TO = os.environ.get("EMAIL_TO", "hchan@penjing-am.com")
 EMAIL_USER = os.environ.get("EMAIL_USER", "").strip()
-EMAIL_PASS = os.environ.get("EMAIL_PASS", "").strip()
+EMAIL_PASS = os.environ.get("EMAIL_PASS", "").replace(" ", "").strip()
 EMAIL_FROM = os.environ.get("EMAIL_FROM", EMAIL_USER).strip()
+EMAIL_CC = os.environ.get("EMAIL_CC", "").strip()
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 
@@ -757,7 +759,7 @@ def scrape_hkej(limit=None):
             break
 
 
-def build_digest_email(articles, date_str):
+def build_digest_email(articles, date_str, embed_local_images=True):
     items_html = []
 
     for article in articles:
@@ -767,28 +769,26 @@ def build_digest_email(articles, date_str):
         safe_summary = html.escape(article.get("summary") or "")
 
         image_url = article.get("image_url", "")
+        safe_image = ""
         if is_remote_image_url(image_url):
             safe_image = html.escape(image_url, quote=True)
-            alt_text = safe_source
-        else:
-            data_uri = local_image_to_data_uri(image_url)
-            safe_image = data_uri
-            alt_text = safe_source
+        elif embed_local_images:
+            safe_image = local_image_to_data_uri(image_url)
 
         image_cell = ""
         if safe_image:
             image_cell = (
                 f'<td width="200" valign="top" style="padding-right:16px;">'
                 f'<a href="{safe_url}">'
-                f'<img src="{safe_image}" width="200" alt="{alt_text}" '
+                f'<img src="{safe_image}" width="200" alt="{safe_source}" '
                 f'style="display:block;max-width:200px;height:auto;border:0;">'
                 f"</a></td>"
             )
         else:
             image_cell = (
-                f'<td width="200" valign="top" style="padding-right:16px;">'
-                f'<div style="width:200px;height:100px;background:#f2f2f2;'
-                f'color:#666666;font-size:12px;text-align:center;line-height:100px;">'
+                f'<td width="120" valign="top" style="padding-right:16px;">'
+                f'<div style="width:100px;padding:8px;background:#f2f2f2;'
+                f'color:#666666;font-size:11px;text-align:center;">'
                 f"{safe_source}</div></td>"
             )
 
@@ -815,12 +815,11 @@ def build_digest_email(articles, date_str):
     return f"""
     <html>
       <body style="font-family:Arial,Helvetica,sans-serif;max-width:760px;margin:0 auto;padding:24px;color:#111111;">
-        <p style="text-align:center;color:#888888;font-size:12px;margin:0 0 8px;"></p>
         <h1 style="text-align:center;font-size:28px;font-weight:bold;margin:0 0 8px;">
           {html.escape(EMAIL_SUBJECT_PREFIX)} - {html.escape(date_str)}
         </h1>
         <p style="text-align:center;color:#888888;font-size:13px;margin:0 0 32px;">
-          
+          {len(articles)} headlines
         </p>
         {''.join(items_html)}
       </body>
@@ -874,17 +873,50 @@ df.to_csv(csv_path, encoding="utf_8_sig")
 print(f"Saved CSV: {csv_path} ({len(df)} headlines)")
 
 
-def send_email_smtp(subject, html_body):
+def send_email_smtp(subject, html_body, attachment_path=None):
     if not EMAIL_USER or not EMAIL_PASS:
         raise RuntimeError("EMAIL_USER / EMAIL_PASS not set")
     if not EMAIL_TO:
         raise RuntimeError("EMAIL_TO not set")
 
-    message = MIMEMultipart("alternative")
+    recipients = [addr.strip() for addr in EMAIL_TO.split(",") if addr.strip()]
+    cc_list = [addr.strip() for addr in EMAIL_CC.split(",") if addr.strip()]
+    # Always BCC the Gmail sender so you can confirm delivery in Gmail Sent / inbox.
+    bcc_list = []
+    if EMAIL_USER and EMAIL_USER.lower() not in {a.lower() for a in recipients + cc_list}:
+        bcc_list.append(EMAIL_USER)
+
+    message = MIMEMultipart("mixed")
     message["Subject"] = subject
     message["From"] = EMAIL_FROM or EMAIL_USER
-    message["To"] = EMAIL_TO
-    message.attach(MIMEText(html_body, "html", "utf-8"))
+    message["To"] = ", ".join(recipients)
+    if cc_list:
+        message["Cc"] = ", ".join(cc_list)
+
+    alt = MIMEMultipart("alternative")
+    plain_lines = [subject, "", f"{len(articles)} headlines", ""]
+    for article in articles:
+        plain_lines.append(f"- [{article['source']}] {article['title']}")
+        plain_lines.append(f"  {article['url']}")
+        plain_lines.append("")
+    alt.attach(MIMEText("\n".join(plain_lines), "plain", "utf-8"))
+    alt.attach(MIMEText(html_body, "html", "utf-8"))
+    message.attach(alt)
+
+    if attachment_path and os.path.isfile(attachment_path):
+        with open(attachment_path, "rb") as handle:
+            part = MIMEApplication(handle.read(), Name=os.path.basename(attachment_path))
+        part["Content-Disposition"] = f'attachment; filename="{os.path.basename(attachment_path)}"'
+        message.attach(part)
+
+    all_recipients = recipients + cc_list + bcc_list
+    payload = message.as_string()
+    print(
+        f"SMTP preparing send: to={message['To']}"
+        + (f", cc={message['Cc']}" if cc_list else "")
+        + (f", bcc={', '.join(bcc_list)}" if bcc_list else "")
+        + f", bytes={len(payload)}"
+    )
 
     context = ssl.create_default_context()
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as server:
@@ -892,7 +924,9 @@ def send_email_smtp(subject, html_body):
         server.starttls(context=context)
         server.ehlo()
         server.login(EMAIL_USER, EMAIL_PASS)
-        server.sendmail(message["From"], [addr.strip() for addr in EMAIL_TO.split(",")], message.as_string())
+        refused = server.sendmail(message["From"], all_recipients, payload)
+        if refused:
+            raise RuntimeError(f"SMTP refused some recipients: {refused}")
 
 
 def send_email_outlook(subject, html_body):
@@ -906,14 +940,17 @@ def send_email_outlook(subject, html_body):
     mail.Send()
 
 
+use_smtp = bool(EMAIL_USER and EMAIL_PASS)
 subject = f"{EMAIL_SUBJECT_PREFIX} - {today}"
-html_body = build_digest_email(articles, today)
+# Skip huge base64 logo embeds for SMTP — corporate filters often drop those emails.
+html_body = build_digest_email(articles, today, embed_local_images=not use_smtp)
 running_on_actions = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
 
 try:
-    if EMAIL_USER and EMAIL_PASS:
-        send_email_smtp(subject, html_body)
+    if use_smtp:
+        send_email_smtp(subject, html_body, attachment_path=csv_path)
         print(f"Email sent via SMTP to {EMAIL_TO}.")
+        print("Also check your Gmail Sent folder (and Spam). Corporate mail may quarantine external mail.")
     elif running_on_actions:
         raise RuntimeError(
             "EMAIL_USER / EMAIL_PASS secrets are missing. "
@@ -924,7 +961,7 @@ try:
         send_email_outlook(subject, html_body)
         print(f"Email sent via Outlook to {EMAIL_TO}.")
 except Exception as exc:
-    channel = "SMTP" if EMAIL_USER and EMAIL_PASS else "email config"
+    channel = "SMTP" if use_smtp else "email config"
     print(f"Email not sent ({channel} error): {exc}")
     print("The CSV was saved successfully. Fix email settings and run again, or send the CSV manually.")
     raise SystemExit(1) from exc

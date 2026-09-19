@@ -47,6 +47,7 @@ jobs:
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_CC: ${{ secrets.EMAIL_CC }}
         run: python Newsheadline.py
 
       - name: Upload CSV artifact
